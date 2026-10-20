@@ -475,7 +475,7 @@ fn test_submit_attestation_inactive_agent() {
         Ok(_) => panic!("inactive agent must not be able to submit an attestation"),
         Err(inner) => {
             let err = inner.expect("inner error must be InvoiceError::UntrustedSigner");
-            assert_eq!(err, InvoiceError::UntrustedSigner);
+            assert_eq!(err, InvoiceError::UntrustedSigner.into());
         }
     }
 
