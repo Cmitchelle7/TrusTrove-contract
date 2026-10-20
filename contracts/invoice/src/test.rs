@@ -4086,6 +4086,74 @@ fn test_mark_funded_fails_zero_amount() {
 }
 
 #[test]
+fn test_set_escrow_contract_admin_can_replace_and_repay_uses_new_address() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    let initial_escrow = mock_escrow_for_pool(&env, &pool, &usdc);
+    client.set_escrow_contract(&initial_escrow);
+    client.mark_funded(&invoice_id, &pool, &usdc, &DEFAULT_FUNDED_AMOUNT);
+    client.mark_shipped(&invoice_id);
+    client.confirm_delivery(&invoice_id, &issuer);
+    client.confirm_delivery(&invoice_id, &buyer);
+    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Confirmed);
+    assert_eq!(client.get_escrow_contract(), Some(initial_escrow.clone()));
+
+    // Deploy a second working escrow and swap. To prove repay actually routes
+    // to the NEW address (not just that the value was stored), we drain the
+    // OLD escrow's storage. If repay were still pointed at initial_escrow,
+    // its `release_to_pool` would panic on the missing "pool" / "asset" keys.
+    // That the repayment below succeeds means the call routed to new_escrow.
+    let new_escrow = mock_escrow_for_pool(&env, &pool, &usdc);
+    assert_ne!(new_escrow, initial_escrow);
+    client.set_escrow_contract(&new_escrow);
+    assert_eq!(client.get_escrow_contract(), Some(new_escrow.clone()));
+
+    env.as_contract(&initial_escrow, || {
+        env.storage().instance().remove(&Symbol::new(&env, "pool"));
+        env.storage().instance().remove(&Symbol::new(&env, "asset"));
+    });
+
+    mint_tokens(&env, &usdc, &buyer, DEFAULT_FACE_VALUE as i128);
+    let repaid = client.repay(&invoice_id);
+    assert!(repaid, "repay must route to the replaced escrow");
+    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Repaid);
+    assert_eq!(client.get_escrow_contract(), Some(new_escrow));
+}
+
+#[test]
+fn test_set_escrow_contract_non_admin_cannot_replace() {
+    let (env, client, _, _, _, usdc) = setup();
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+
+    // Seed a working escrow as admin (setup mocks all auths), then clear
+    // auths so the next call has to satisfy require_auth on its own.
+    let initial_escrow = mock_escrow_for_pool(&env, &pool, &usdc);
+    client.set_escrow_contract(&initial_escrow);
+    let before = client.get_escrow_contract();
+    assert_eq!(before, Some(initial_escrow));
+
+    // From here, no auths are mocked: only the stored admin could satisfy
+    // set_escrow_contract, and we are invoking with no auth context.
+    env.set_auths(&[]);
+    let replacement = mock_escrow_for_pool(&env, &pool, &usdc);
+    let result = env.try_invoke_contract::<(), InvoiceError>(
+        &client.address,
+        &Symbol::new(&env, "set_escrow_contract"),
+        (replacement,).into_val(&env),
+    );
+    assert!(result.is_err(), "non-admin must not replace escrow");
+
+    // Storage must be unchanged — the rejected call must not partially apply.
+    assert_eq!(client.get_escrow_contract(), before);
+}
+#[test]
 fn test_remove_supported_asset() {
     let (env, client, _, _, _, usdc) = setup();
 
@@ -4105,78 +4173,6 @@ fn test_remove_supported_asset() {
 }
 
 #[test]
-#[test]
-fn test_set_escrow_contract_admin_can_replace_and_repay_uses_new_address() {
-    let (env, client, issuer, buyer, pool, usdc) = setup();
-
-    // Fund the invoice first so repay has work to do, using the initial escrow.
-    let invoice_id = client.create_invoice(
-        &issuer,
-        &buyer,
-        &DEFAULT_FACE_VALUE,
-        &(env.ledger().timestamp() + DEFAULT_DUE_OFFSET),
-        &DEFAULT_DISCOUNT_BPS,
-        &usdc,
-    );
-    let initial_escrow = client.get_escrow_contract().expect("setup wires escrow");
-    client.mark_funded(&invoice_id, &pool, &usdc, &DEFAULT_FUNDED_AMOUNT);
-    client.mark_shipped(&invoice_id);
-    client.confirm_delivery(&invoice_id, &issuer);
-    client.confirm_delivery(&invoice_id, &buyer);
-    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Confirmed);
-
-    // Replace the escrow with a fresh address. This is the AC's positive path.
-    let new_escrow = Address::generate(&env);
-    assert_ne!(new_escrow, initial_escrow);
-    client.set_escrow_contract(&new_escrow);
-    assert_eq!(client.get_escrow_contract(), Some(new_escrow.clone()));
-
-    // Repay. The stored escrow is now `new_escrow`, so repay must route its
-    // release_to_pool call to the new address. We assert by checking the
-    // emitted topics include a contract that is NOT the initial escrow and
-    // IS the new escrow. The repay function reads DataKey::EscrowContract
-    // at the top of the call, so this both proves the read picked up the
-    // new value and that the write we did earlier persisted.
-    mint_tokens(&env, &usdc, &buyer, DEFAULT_FACE_VALUE as i128);
-    let repaid = client.repay(&invoice_id);
-    assert!(repaid);
-    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Repaid);
-
-    // Behavioural proof of the address swap: if repay had used the old
-    // escrow (a fresh Address::generate in the fixture, with no code
-    // deployed), the cross-contract call would have panicked. That it
-    // succeeded means the call routed to the new escrow, which setup()
-    // deploys as a working mock.
-    assert_eq!(client.get_escrow_contract(), Some(new_escrow));
-}
-
-#[test]
-fn test_set_escrow_contract_non_admin_cannot_replace() {
-    let (env, client, _, _, _, _) = setup();
-    let admin = client.get_admin().expect("setup wires admin");
-
-    // Snapshot current escrow (the fixture's mock escrow).
-    let before = client.get_escrow_contract();
-    assert!(before.is_some(), "setup wires a default escrow");
-
-    // A stranger (neither admin nor anyone the contract will authorise)
-    // must not be able to replace the escrow.
-    let stranger = Address::generate(&env);
-    assert_ne!(stranger, admin);
-
-    let replacement = Address::generate(&env);
-    assert_ne!(replacement, before.clone().unwrap());
-
-    let result = env.try_invoke_contract::<(), InvoiceError>(
-        &client.address,
-        &Symbol::new(&env, "set_escrow_contract"),
-        (replacement.clone(),).into_val(&env),
-    );
-    assert!(result.is_err(), "non-admin must not replace escrow");
-
-    // Storage must be unchanged — the negative path must not partially apply.
-    assert_eq!(client.get_escrow_contract(), before);
-}
 fn test_set_escrow_contract() {
     let (env, client, _, _, _, _) = setup();
     let new_escrow = Address::generate(&env);
