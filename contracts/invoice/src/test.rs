@@ -420,9 +420,7 @@ fn test_submit_attestation_untrusted_signer_wrong_pubkey() {
 
     client.submit_attestation(&invoice_id, &payload_bytes, &signature);
 }
-
 #[test]
-#[should_panic(expected = "Error(Contract, #21)")]
 fn test_submit_attestation_inactive_agent() {
     let (env, client, issuer, buyer, _, usdc) = setup();
     let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
@@ -432,7 +430,11 @@ fn test_submit_attestation_inactive_agent() {
     let registry_id = env.register_contract(None, MockAgentRegistry);
     let registry_client = MockAgentRegistryClient::new(&env, &registry_id);
 
-    // Register agent as inactive
+    // Register agent as inactive but with the CORRECT pubkey for the signing
+    // key used below. This isolates "inactive" from "wrong pubkey" so the test
+    // pins the `active == false` branch in `submit_attestation`, not the
+    // untrusted-signer-by-mismatch branch (covered by
+    // `test_submit_attestation_untrusted_signer_wrong_pubkey`).
     registry_client.register_agent(
         &agent_id,
         &crate::Agent {
@@ -460,7 +462,35 @@ fn test_submit_attestation_inactive_agent() {
     sig_bytes[64] = recid.to_byte();
     let signature = BytesN::from_array(&env, &sig_bytes);
 
-    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+    // Record event count before the call. submit_attestation emits
+    // `attestation_submitted` only on success, so a failing call must not
+    // increase this count.
+    let events_before = env.events().all().len();
+
+    // Use the fallible client variant so we can assert on the Result and then
+    // continue inspecting storage/events. `try_submit_attestation` returns the
+    // typed error path (#21 = UntrustedSigner) rather than aborting the test.
+    let result = client.try_submit_attestation(&invoice_id, &payload_bytes, &signature);
+    match result {
+        Ok(_) => panic!("inactive agent must not be able to submit an attestation"),
+        Err(inner) => {
+            let err = inner.expect("inner error must be InvoiceError::UntrustedSigner");
+            assert_eq!(err, InvoiceError::UntrustedSigner);
+        }
+    }
+
+    // AC2: no attestation was persisted, and no attestation_submitted event
+    // was emitted. Both checks would be unreachable with `#[should_panic]`,
+    // which is why this test uses the fallible client variant.
+    assert!(
+        client.get_attestation(&invoice_id).is_none(),
+        "rejected attestation must not be stored"
+    );
+    assert_eq!(
+        env.events().all().len(),
+        events_before,
+        "rejected attestation must not emit attestation_submitted"
+    );
 }
 
 #[test]
